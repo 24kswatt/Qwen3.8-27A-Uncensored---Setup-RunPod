@@ -16,6 +16,8 @@ IFS=$'\n\t'
 #   export HF_TOKEN='hf_...'
 #   export LLAMA_API_KEY='...'
 #   export WORKSPACE=/workspace
+#   export PARALLEL=4
+#   export CTX_PER_USER=319488   # 312 Ki tokens = 312*1024
 
 WORKSPACE="${WORKSPACE:-/workspace}"
 MODEL_REPO="${MODEL_REPO:-huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF}"
@@ -30,18 +32,22 @@ SERVER_RUNNER="$LLAMA_DIR/run-qwen.sh"
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
-CTX="${CTX:-524288}"
+# Multi-user defaults: 4 concurrent slots, 312 Ki tokens per user.
+# 312 Ki = 319488 tokens. Qwen3.8 native context is 262144, so YaRN extends it ~1.21875x.
+PARALLEL="${PARALLEL:-4}"
+NATIVE_CTX="${NATIVE_CTX:-262144}"
+CTX_PER_USER="${CTX_PER_USER:-319488}"
+TOTAL_CTX=$((PARALLEL * CTX_PER_USER))
+ROPE_SCALE="${ROPE_SCALE:-$(awk -v target="$CTX_PER_USER" -v native="$NATIVE_CTX" 'BEGIN { printf "%.8f", target/native }')}"
+
 N_GPU_LAYERS="${N_GPU_LAYERS:-999}"
 THREADS="${THREADS:-8}"
 THREADS_BATCH="${THREADS_BATCH:-8}"
-HTTP_THREADS="${HTTP_THREADS:-4}"
+HTTP_THREADS="${HTTP_THREADS:-8}"
 
-# Requested Qwen3.8 tuning.
-ROPE_SCALE="${ROPE_SCALE:-2}"
-YARN_ORIG_CTX="${YARN_ORIG_CTX:-262144}"
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-q4_0}"
-BATCH="${BATCH:-4096}"
-UBATCH="${UBATCH:-512}"
+BATCH="${BATCH:-2048}"
+UBATCH="${UBATCH:-256}"
 
 # Q8_0_L is ~38.8 GB. Leave room for repo/build/temp files.
 MIN_FREE_GB="${MIN_FREE_GB:-45}"
@@ -70,11 +76,22 @@ fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+validate_config() {
+  [[ "$PARALLEL" =~ ^[1-9][0-9]*$ ]] || die "PARALLEL deve essere un intero > 0."
+  [[ "$NATIVE_CTX" =~ ^[1-9][0-9]*$ ]] || die "NATIVE_CTX deve essere un intero > 0."
+  [[ "$CTX_PER_USER" =~ ^[1-9][0-9]*$ ]] || die "CTX_PER_USER deve essere un intero > 0."
+
+  if (( CTX_PER_USER <= NATIVE_CTX )); then
+    warn "CTX_PER_USER <= NATIVE_CTX: YaRN non sarebbe necessario, ma resta abilitato con scale=$ROPE_SCALE."
+  fi
+}
+
 header() {
   clear 2>/dev/null || true
   printf "${C_BOLD}Qwen3.8 / llama.cpp CUDA bootstrap${C_RESET}\n"
-  printf "Workspace : %s\nModel     : %s/%s\nSession   : %s\n\n" \
-    "$WORKSPACE" "$MODEL_REPO" "$MODEL_FILE" "$TMUX_SESSION"
+  printf "Workspace : %s\nModel     : %s/%s\nSession   : %s\nUsers     : %s concurrent\nContext   : %s tokens/user\nKV pool   : %s tokens total\nNative ctx: %s\nYaRN scale: %s\n\n" \
+    "$WORKSPACE" "$MODEL_REPO" "$MODEL_FILE" "$TMUX_SESSION" \
+    "$PARALLEL" "$CTX_PER_USER" "$TOTAL_CTX" "$NATIVE_CTX" "$ROPE_SCALE"
 }
 
 disk_preflight() {
@@ -176,6 +193,12 @@ hf_auth_if_needed() {
 }
 
 download_model() {
+  # Hard skip: if the final GGUF already exists and is non-empty, do not even call HF.
+  if [[ -s "$MODEL_PATH" ]]; then
+    ok "Modello già presente: $MODEL_PATH ($(du -h "$MODEL_PATH" | awk '{print $1}'))"
+    return 0
+  fi
+
   disk_preflight
   setup_hf
   hf_auth_if_needed
@@ -234,6 +257,21 @@ sanity_check() {
   printf "\n${C_BOLD}llama-server --list-devices${C_RESET}\n"
   "$LLAMA_DIR/build/bin/llama-server" --list-devices || true
 
+  local server_help
+  server_help="$("$LLAMA_DIR/build/bin/llama-server" --help 2>&1 || true)"
+
+  for required_flag in \
+    '--kv-unified-per-slot' \
+    '--kv-unified' \
+    '--rope-scaling' \
+    '--rope-scale' \
+    '--yarn-orig-ctx' \
+    '--override-kv'; do
+    grep -q -- "$required_flag" <<<"$server_help" || \
+      die "Questa build di llama-server non supporta $required_flag. Aggiorna/rebuilda llama.cpp."
+  done
+  ok "Multi-user KV + YaRN supportati"
+
   printf "\n${C_BOLD}nvidia-smi${C_RESET}\n"
   nvidia-smi
 
@@ -257,11 +295,13 @@ exec ./build/bin/llama-server \\
   --host "$HOST" \\
   --port "$PORT" \\
   -ngl "$N_GPU_LAYERS" \\
-  -c "$CTX" \\
+  -np "$PARALLEL" \\
+  --kv-unified \\
+  --kv-unified-per-slot "$CTX_PER_USER" \\
   --rope-scaling yarn \\
   --rope-scale "$ROPE_SCALE" \\
-  --yarn-orig-ctx "$YARN_ORIG_CTX" \\
-  --override-kv qwen35.context_length=int:"$CTX" \\
+  --yarn-orig-ctx "$NATIVE_CTX" \\
+  --override-kv qwen35.context_length=int:"$CTX_PER_USER" \\
   -fa on \\
   -ctk "$KV_CACHE_TYPE" \\
   -ctv "$KV_CACHE_TYPE" \\
@@ -269,7 +309,6 @@ exec ./build/bin/llama-server \\
   -ub "$UBATCH" \\
   -t "$THREADS" \\
   -tb "$THREADS_BATCH" \\
-  -np 1 \\
   --cont-batching \\
   --cache-prompt \\
   --cache-reuse 256 \\
@@ -298,11 +337,11 @@ ensure_api_key() {
     return 0
   fi
 
-  [[ -t 0 ]] || die "Imposta LLAMA_API_KEY nell'ambiente prima di usare 'start'."
+  [[ -r /dev/tty ]] || die "Imposta LLAMA_API_KEY nell'ambiente prima di usare 'start'."
 
-  printf "LLAMA_API_KEY (input nascosto): "
-  IFS= read -r -s LLAMA_API_KEY
-  printf "\n"
+  printf "LLAMA_API_KEY (input nascosto; puoi usare key1,key2,...): " >/dev/tty
+  IFS= read -r -s LLAMA_API_KEY </dev/tty
+  printf "\n" >/dev/tty
   [[ -n "$LLAMA_API_KEY" ]] || die "API key vuota."
   export LLAMA_API_KEY
 }
@@ -331,6 +370,8 @@ start_server() {
     ok "llama-server avviato in tmux '$TMUX_SESSION'"
     printf "Attach : tmux attach -t %q\n" "$TMUX_SESSION"
     printf "API    : http://127.0.0.1:%s/v1\n" "$PORT"
+    printf "Users  : %s concurrent slots\n" "$PARALLEL"
+    printf "Context: %s tokens per slot (%s total KV pool)\n" "$CTX_PER_USER" "$TOTAL_CTX"
     printf "Health : curl -s http://127.0.0.1:%s/health\n" "$PORT"
   else
     die "La sessione tmux è terminata subito. Avvia '$SERVER_RUNNER' a mano per vedere l'errore."
@@ -338,6 +379,11 @@ start_server() {
 }
 
 status_server() {
+  printf "${C_BOLD}CONFIG${C_RESET}\n"
+  printf "Parallel slots : %s\n" "$PARALLEL"
+  printf "Context / slot : %s tokens\n" "$CTX_PER_USER"
+  printf "KV pool target : %s tokens\n\n" "$TOTAL_CTX"
+
   printf "${C_BOLD}TMUX${C_RESET}\n"
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     ok "Sessione '$TMUX_SESSION' attiva"
@@ -387,6 +433,12 @@ python_menu() {
   python3 - <<'PY'
 import sys
 
+# Python source arrives on stdin via heredoc; read the user's choice from the terminal.
+try:
+    tty = open("/dev/tty", "r")
+except OSError:
+    sys.exit(130)
+
 items = [
     ("all",      "FULL install: APT + HF download + build CUDA + tmux"),
     ("deps",     "APT update/upgrade + dipendenze"),
@@ -406,7 +458,7 @@ for i, (_, label) in enumerate(items, 1):
 
 try:
     print("\nSelezione: ", end="", flush=True, file=sys.stderr)
-    raw = input().strip()
+    raw = tty.readline().strip()
 except (EOFError, KeyboardInterrupt):
     print(file=sys.stderr)
     sys.exit(130)
@@ -458,7 +510,11 @@ Esempio non interattivo:
 
 Variabili principali:
   WORKSPACE=$WORKSPACE
-  CTX=$CTX
+  PARALLEL=$PARALLEL
+  NATIVE_CTX=$NATIVE_CTX
+  CTX_PER_USER=$CTX_PER_USER
+  TOTAL_CTX=$TOTAL_CTX
+  ROPE_SCALE=$ROPE_SCALE
   N_GPU_LAYERS=$N_GPU_LAYERS
   KV_CACHE_TYPE=$KV_CACHE_TYPE
   PORT=$PORT
@@ -466,6 +522,7 @@ EOF
 }
 
 main() {
+  validate_config
   local action="${1:-}"
 
   if [[ -z "$action" ]]; then
