@@ -16,8 +16,7 @@ IFS=$'\n\t'
 #   export HF_TOKEN='hf_...'
 #   export LLAMA_API_KEY='...'
 #   export WORKSPACE=/workspace
-#   export PARALLEL=3
-#   export CTX_PER_USER=262144   # 256 Ki tokens = native context per user
+#   export CTX_SIZE=262144       # 256 Ki tokens, single user
 #   export KV_CACHE_TYPE_K=q8_0
 #   export KV_CACHE_TYPE_V=q8_0
 
@@ -34,12 +33,10 @@ SERVER_RUNNER="$LLAMA_DIR/run-qwen.sh"
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
-# Multi-user defaults: 4 concurrent slots, 256 Ki tokens per user.
-# 256 Ki = 262144 tokens, which matches Qwen3.8's native context.
-PARALLEL="${PARALLEL:-3}"
+# Single-user configuration.
+# 256 Ki = 262144 tokens, matching Qwen3.8's native context.
 NATIVE_CTX="${NATIVE_CTX:-262144}"
-CTX_PER_USER="${CTX_PER_USER:-262144}"
-TOTAL_CTX=$((PARALLEL * CTX_PER_USER))
+CTX_SIZE="${CTX_SIZE:-262144}"
 
 N_GPU_LAYERS="${N_GPU_LAYERS:-999}"
 THREADS="${THREADS:-8}"
@@ -79,21 +76,20 @@ fi
 have() { command -v "$1" >/dev/null 2>&1; }
 
 validate_config() {
-  [[ "$PARALLEL" =~ ^[1-9][0-9]*$ ]] || die "PARALLEL deve essere un intero > 0."
   [[ "$NATIVE_CTX" =~ ^[1-9][0-9]*$ ]] || die "NATIVE_CTX deve essere un intero > 0."
-  [[ "$CTX_PER_USER" =~ ^[1-9][0-9]*$ ]] || die "CTX_PER_USER deve essere un intero > 0."
+  [[ "$CTX_SIZE" =~ ^[1-9][0-9]*$ ]] || die "CTX_SIZE deve essere un intero > 0."
 
-  if (( CTX_PER_USER > NATIVE_CTX )); then
-    die "CTX_PER_USER=$CTX_PER_USER supera il context nativo $NATIVE_CTX. Questo profilo non abilita YaRN: usa <= $NATIVE_CTX oppure aggiungi esplicitamente lo scaling."
+  if (( CTX_SIZE > NATIVE_CTX )); then
+    die "CTX_SIZE=$CTX_SIZE supera il context nativo $NATIVE_CTX. Questo profilo non abilita YaRN: usa <= $NATIVE_CTX oppure aggiungi esplicitamente lo scaling."
   fi
 }
 
 header() {
   clear 2>/dev/null || true
   printf "${C_BOLD}Qwen3.8 / llama.cpp CUDA bootstrap${C_RESET}\n"
-  printf "Workspace : %s\nModel     : %s/%s\nSession   : %s\nUsers     : %s concurrent\nContext   : %s tokens/user\nKV pool   : %s tokens total\nNative ctx: %s\nKV cache  : %s / %s\n\n" \
+  printf "Workspace : %s\nModel     : %s/%s\nSession   : %s\nUsers     : 1\nContext   : %s tokens\nNative ctx: %s\nKV cache  : %s / %s\n\n" \
     "$WORKSPACE" "$MODEL_REPO" "$MODEL_FILE" "$TMUX_SESSION" \
-    "$PARALLEL" "$CTX_PER_USER" "$TOTAL_CTX" "$NATIVE_CTX" "$KV_CACHE_TYPE_K" "$KV_CACHE_TYPE_V"
+    "$CTX_SIZE" "$NATIVE_CTX" "$KV_CACHE_TYPE_K" "$KV_CACHE_TYPE_V"
 }
 
 disk_preflight() {
@@ -259,16 +255,6 @@ sanity_check() {
   printf "\n${C_BOLD}llama-server --list-devices${C_RESET}\n"
   "$LLAMA_DIR/build/bin/llama-server" --list-devices || true
 
-  local server_help
-  server_help="$("$LLAMA_DIR/build/bin/llama-server" --help 2>&1 || true)"
-
-  for required_flag in \
-    '--kv-unified-per-slot' \
-    '--kv-unified'; do
-    grep -q -- "$required_flag" <<<"$server_help" || \
-      die "Questa build di llama-server non supporta $required_flag. Aggiorna/rebuilda llama.cpp."
-  done
-  ok "Multi-user unified KV supportato"
 
   printf "\n${C_BOLD}nvidia-smi${C_RESET}\n"
   nvidia-smi
@@ -293,9 +279,7 @@ exec ./build/bin/llama-server \\
   --host "$HOST" \\
   --port "$PORT" \\
   -ngl "$N_GPU_LAYERS" \\
-  -np "$PARALLEL" \\
-  --kv-unified \\
-  --kv-unified-per-slot "$CTX_PER_USER" \\
+  -c "$CTX_SIZE" \\
   -fa on \\
   -ctk "$KV_CACHE_TYPE_K" \\
   -ctv "$KV_CACHE_TYPE_V" \\
@@ -364,8 +348,8 @@ start_server() {
     ok "llama-server avviato in tmux '$TMUX_SESSION'"
     printf "Attach : tmux attach -t %q\n" "$TMUX_SESSION"
     printf "API    : http://127.0.0.1:%s/v1\n" "$PORT"
-    printf "Users  : %s concurrent slots\n" "$PARALLEL"
-    printf "Context: %s tokens per slot (%s total KV pool)\n" "$CTX_PER_USER" "$TOTAL_CTX"
+    printf "Users  : 1\n"
+    printf "Context: %s tokens\n" "$CTX_SIZE"
     printf "Health : curl -s http://127.0.0.1:%s/health\n" "$PORT"
   else
     die "La sessione tmux è terminata subito. Avvia '$SERVER_RUNNER' a mano per vedere l'errore."
@@ -374,9 +358,8 @@ start_server() {
 
 status_server() {
   printf "${C_BOLD}CONFIG${C_RESET}\n"
-  printf "Parallel slots : %s\n" "$PARALLEL"
-  printf "Context / slot : %s tokens\n" "$CTX_PER_USER"
-  printf "KV pool target : %s tokens\n" "$TOTAL_CTX"
+  printf "Users          : 1\n"
+  printf "Context        : %s tokens\n" "$CTX_SIZE"
   printf "KV cache       : K=%s / V=%s\n\n" "$KV_CACHE_TYPE_K" "$KV_CACHE_TYPE_V"
 
   printf "${C_BOLD}TMUX${C_RESET}\n"
@@ -505,10 +488,8 @@ Esempio non interattivo:
 
 Variabili principali:
   WORKSPACE=$WORKSPACE
-  PARALLEL=$PARALLEL
   NATIVE_CTX=$NATIVE_CTX
-  CTX_PER_USER=$CTX_PER_USER
-  TOTAL_CTX=$TOTAL_CTX
+  CTX_SIZE=$CTX_SIZE
   N_GPU_LAYERS=$N_GPU_LAYERS
   KV_CACHE_TYPE_K=$KV_CACHE_TYPE_K
   KV_CACHE_TYPE_V=$KV_CACHE_TYPE_V
