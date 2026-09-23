@@ -16,8 +16,10 @@ IFS=$'\n\t'
 #   export HF_TOKEN='hf_...'
 #   export LLAMA_API_KEY='...'
 #   export WORKSPACE=/workspace
-#   export PARALLEL=4
-#   export CTX_PER_USER=319488   # 312 Ki tokens = 312*1024
+#   export PARALLEL=3
+#   export CTX_PER_USER=262144   # 256 Ki tokens = native context per user
+#   export KV_CACHE_TYPE_K=q8_0
+#   export KV_CACHE_TYPE_V=q8_0
 
 WORKSPACE="${WORKSPACE:-/workspace}"
 MODEL_REPO="${MODEL_REPO:-huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF}"
@@ -32,20 +34,20 @@ SERVER_RUNNER="$LLAMA_DIR/run-qwen.sh"
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
-# Multi-user defaults: 4 concurrent slots, 312 Ki tokens per user.
-# 312 Ki = 319488 tokens. Qwen3.8 native context is 262144, so YaRN extends it ~1.21875x.
-PARALLEL="${PARALLEL:-4}"
+# Multi-user defaults: 4 concurrent slots, 256 Ki tokens per user.
+# 256 Ki = 262144 tokens, which matches Qwen3.8's native context.
+PARALLEL="${PARALLEL:-3}"
 NATIVE_CTX="${NATIVE_CTX:-262144}"
-CTX_PER_USER="${CTX_PER_USER:-319488}"
+CTX_PER_USER="${CTX_PER_USER:-262144}"
 TOTAL_CTX=$((PARALLEL * CTX_PER_USER))
-ROPE_SCALE="${ROPE_SCALE:-$(awk -v target="$CTX_PER_USER" -v native="$NATIVE_CTX" 'BEGIN { printf "%.8f", target/native }')}"
 
 N_GPU_LAYERS="${N_GPU_LAYERS:-999}"
 THREADS="${THREADS:-8}"
 THREADS_BATCH="${THREADS_BATCH:-8}"
 HTTP_THREADS="${HTTP_THREADS:-8}"
 
-KV_CACHE_TYPE="${KV_CACHE_TYPE:-q4_0}"
+KV_CACHE_TYPE_K="${KV_CACHE_TYPE_K:-q8_0}"
+KV_CACHE_TYPE_V="${KV_CACHE_TYPE_V:-q8_0}"
 BATCH="${BATCH:-2048}"
 UBATCH="${UBATCH:-256}"
 
@@ -81,17 +83,17 @@ validate_config() {
   [[ "$NATIVE_CTX" =~ ^[1-9][0-9]*$ ]] || die "NATIVE_CTX deve essere un intero > 0."
   [[ "$CTX_PER_USER" =~ ^[1-9][0-9]*$ ]] || die "CTX_PER_USER deve essere un intero > 0."
 
-  if (( CTX_PER_USER <= NATIVE_CTX )); then
-    warn "CTX_PER_USER <= NATIVE_CTX: YaRN non sarebbe necessario, ma resta abilitato con scale=$ROPE_SCALE."
+  if (( CTX_PER_USER > NATIVE_CTX )); then
+    die "CTX_PER_USER=$CTX_PER_USER supera il context nativo $NATIVE_CTX. Questo profilo non abilita YaRN: usa <= $NATIVE_CTX oppure aggiungi esplicitamente lo scaling."
   fi
 }
 
 header() {
   clear 2>/dev/null || true
   printf "${C_BOLD}Qwen3.8 / llama.cpp CUDA bootstrap${C_RESET}\n"
-  printf "Workspace : %s\nModel     : %s/%s\nSession   : %s\nUsers     : %s concurrent\nContext   : %s tokens/user\nKV pool   : %s tokens total\nNative ctx: %s\nYaRN scale: %s\n\n" \
+  printf "Workspace : %s\nModel     : %s/%s\nSession   : %s\nUsers     : %s concurrent\nContext   : %s tokens/user\nKV pool   : %s tokens total\nNative ctx: %s\nKV cache  : %s / %s\n\n" \
     "$WORKSPACE" "$MODEL_REPO" "$MODEL_FILE" "$TMUX_SESSION" \
-    "$PARALLEL" "$CTX_PER_USER" "$TOTAL_CTX" "$NATIVE_CTX" "$ROPE_SCALE"
+    "$PARALLEL" "$CTX_PER_USER" "$TOTAL_CTX" "$NATIVE_CTX" "$KV_CACHE_TYPE_K" "$KV_CACHE_TYPE_V"
 }
 
 disk_preflight() {
@@ -262,15 +264,11 @@ sanity_check() {
 
   for required_flag in \
     '--kv-unified-per-slot' \
-    '--kv-unified' \
-    '--rope-scaling' \
-    '--rope-scale' \
-    '--yarn-orig-ctx' \
-    '--override-kv'; do
+    '--kv-unified'; do
     grep -q -- "$required_flag" <<<"$server_help" || \
       die "Questa build di llama-server non supporta $required_flag. Aggiorna/rebuilda llama.cpp."
   done
-  ok "Multi-user KV + YaRN supportati"
+  ok "Multi-user unified KV supportato"
 
   printf "\n${C_BOLD}nvidia-smi${C_RESET}\n"
   nvidia-smi
@@ -298,13 +296,9 @@ exec ./build/bin/llama-server \\
   -np "$PARALLEL" \\
   --kv-unified \\
   --kv-unified-per-slot "$CTX_PER_USER" \\
-  --rope-scaling yarn \\
-  --rope-scale "$ROPE_SCALE" \\
-  --yarn-orig-ctx "$NATIVE_CTX" \\
-  --override-kv qwen35.context_length=int:"$CTX_PER_USER" \\
   -fa on \\
-  -ctk "$KV_CACHE_TYPE" \\
-  -ctv "$KV_CACHE_TYPE" \\
+  -ctk "$KV_CACHE_TYPE_K" \\
+  -ctv "$KV_CACHE_TYPE_V" \\
   -b "$BATCH" \\
   -ub "$UBATCH" \\
   -t "$THREADS" \\
@@ -382,7 +376,8 @@ status_server() {
   printf "${C_BOLD}CONFIG${C_RESET}\n"
   printf "Parallel slots : %s\n" "$PARALLEL"
   printf "Context / slot : %s tokens\n" "$CTX_PER_USER"
-  printf "KV pool target : %s tokens\n\n" "$TOTAL_CTX"
+  printf "KV pool target : %s tokens\n" "$TOTAL_CTX"
+  printf "KV cache       : K=%s / V=%s\n\n" "$KV_CACHE_TYPE_K" "$KV_CACHE_TYPE_V"
 
   printf "${C_BOLD}TMUX${C_RESET}\n"
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
@@ -514,9 +509,9 @@ Variabili principali:
   NATIVE_CTX=$NATIVE_CTX
   CTX_PER_USER=$CTX_PER_USER
   TOTAL_CTX=$TOTAL_CTX
-  ROPE_SCALE=$ROPE_SCALE
   N_GPU_LAYERS=$N_GPU_LAYERS
-  KV_CACHE_TYPE=$KV_CACHE_TYPE
+  KV_CACHE_TYPE_K=$KV_CACHE_TYPE_K
+  KV_CACHE_TYPE_V=$KV_CACHE_TYPE_V
   PORT=$PORT
 EOF
 }
